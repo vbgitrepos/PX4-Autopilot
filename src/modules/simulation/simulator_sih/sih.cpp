@@ -332,7 +332,7 @@ void Sih::parameters_updated()
 		const Dcmf R_E2N = _lla.computeRotEcefToNed();
 		_R_N2E = R_E2N.transpose();
 		_v_E = _R_N2E * _v_N;
-
+		_q = Quatf(Eulerf(0.f, 0.f, _sih_yaw0.get()));
 		_q_E = Quatf(_R_N2E) * _q;
 		_q_E.normalize();
 	}
@@ -466,7 +466,7 @@ void Sih::generate_force_and_torques(const float dt)
 		float u_sq[6];
 
 		for (int i = 0; i < 6; ++i) {
-			u_sq[i] = _u[i] * _u[i]; // quadratic thrust model, keep _u[i] intact for the filter
+			u_sq[i] = _u[i] * fabsf(_u[i]);
 		}
 
 		_T_B = Vector3f(0.0f, 0.0f, -_T_MAX * (+u_sq[0] + u_sq[1] + u_sq[2] + u_sq[3] + u_sq[4] + u_sq[5]));
