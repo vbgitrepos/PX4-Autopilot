@@ -66,16 +66,16 @@ then
 fi
 
 # Internal SPI bus ICM45686 on SPI1
-icm45686 -s -b 1 -R 6 start
+icm45686 -s -b 1 -R 14 start
 
 # Sensors IMU#1 ICM45686 on SPI2
-icm45686 -s -b 2 -R 10 start
+icm45686 -s -b 2 -R 6 start
 
 # Sensors IMU#2 BMI088 on SPI3 (accel)
-bmi088 -A -s -b 3 -R 0 start
+bmi088 -A -s -b 3 -R 4 start
 
 # Sensors IMU#2 BMI088 on SPI3 (gyro)
-bmi088 -G -s -b 3 -R 0 start
+bmi088 -G -s -b 3 -R 4 start
 
 # Internal barometer BMP581 on I2C2
 bmp581 -I -b 2 -a 0x46 start
