@@ -53,7 +53,7 @@ Battery::Battery(int index, ModuleParams *parent, const int sample_interval_us, 
 	_index(index < 1 || index > 9 ? 1 : index),
 	_source(source)
 {
-	const float expected_filter_dt = static_cast<float>(sample_interval_us) / 1_s;
+	const float expected_filter_dt = static_cast<float>(sample_interval_us) * 1e-6f;
 	_current_average_filter_a.setParameters(expected_filter_dt, 50.f);
 	_ocv_filter_v.setParameters(expected_filter_dt, 1.f);
 	_cell_voltage_filter_v.setParameters(expected_filter_dt, 1.f);
@@ -212,7 +212,10 @@ void Battery::updateAndPublishBatteryStatus(const hrt_abstime &timestamp)
 	battery_status_s battery_status = getBatteryStatus();
 
 	_failure_config.update();
-	failure_injection::process_battery(_failure_config, battery_status.id, battery_status);
+
+	if (!failure_injection::process_battery(_failure_config, battery_status.id, battery_status)) {
+		return;
+	}
 
 	publishBatteryStatus(battery_status);
 }

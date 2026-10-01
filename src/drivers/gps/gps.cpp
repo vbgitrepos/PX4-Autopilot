@@ -50,7 +50,6 @@
 #include <drivers/drv_sensor.h>
 #include <lib/drivers/device/Device.hpp>
 #include <lib/parameters/param.h>
-#include <lib/perf/perf_counter.h>
 #include <mathlib/mathlib.h>
 #include <matrix/math.hpp>
 #include <px4_platform_common/px4_config.h>
@@ -62,15 +61,17 @@
 #include <px4_platform_common/Serial.hpp>
 #include <uORB/Publication.hpp>
 #include <uORB/PublicationMulti.hpp>
-#include <uORB/Subscription.hpp>
-#include <uORB/SubscriptionMultiArray.hpp>
 #include <uORB/topics/gps_dump.h>
 #include <uORB/topics/rtcm_data.h>
-#include <uORB/topics/sensor_gps.h>
+#include <uORB/topics/sensor_gnss.h>
 #include <uORB/topics/sensor_gnss_relative.h>
-
+#include <uORB/topics/sensor_gnss_rf.h>
+#if defined(CONFIG_GPS_UBX_SPAN)
+#include <uORB/topics/sensor_gnss_spectrum.h>
+#endif
 #include <lib/failure_injection/FailureInjection.hpp>
-#include <lib/gnss/correction_framer.h>
+#include <lib/gnss/correction_injector.h>
+#include <systemlib/system_time_source.h>
 
 #include "devices/src/gps_helper.h"
 
@@ -148,7 +149,11 @@ struct GPS_Sat_Info {
 	satellite_info_s _data;
 };
 
+#if defined(CONFIG_GPS_UBX_SPAN)
+static constexpr int TASK_STACK_SIZE = PX4_STACK_ADJUSTED(2750);
+#else
 static constexpr int TASK_STACK_SIZE = PX4_STACK_ADJUSTED(2040);
+#endif
 
 
 class GPS : public ModuleBase, public device::Device
@@ -236,33 +241,39 @@ private:
 
 	GPS_Sat_Info			*_sat_info{nullptr};				///< instance of GPS sat info data object
 
-	sensor_gps_s			_sensor_gps{};				///< uORB topic for gps position
+	sensor_gnss_s			_sensor_gnss{};				///< uORB topic for gps position
 	satellite_info_s		*_p_report_sat_info{nullptr};			///< pointer to uORB topic for satellite info
 
-	uORB::PublicationMulti<sensor_gps_s>	_sensor_gps_pub{ORB_ID(sensor_gps)};	///< uORB pub for gps position
+	uORB::PublicationMulti<sensor_gnss_s>	_sensor_gnss_pub{ORB_ID(sensor_gnss)};	///< uORB pub for gps position
 	uORB::PublicationMulti<sensor_gnss_relative_s> _sensor_gnss_relative_pub{ORB_ID(sensor_gnss_relative)};
-
-	uORB::PublicationMulti<satellite_info_s>	_report_sat_info_pub{ORB_ID(satellite_info)};		///< uORB pub for satellite info
+	uORB::PublicationMulti<sensor_gnss_rf_s> _sensor_gnss_rf_block_pub[kMaxBlocks] {
+		{ORB_ID(sensor_gnss_rf_block0)},
+		{ORB_ID(sensor_gnss_rf_block1)},
+		{ORB_ID(sensor_gnss_rf_block2)},
+	};
+#if defined(CONFIG_GPS_UBX_SPAN)
+	uORB::PublicationMulti<sensor_gnss_spectrum_s> _sensor_gnss_spectrum_block_pub[kMaxBlocks] {
+		{ORB_ID(sensor_gnss_spectrum_block0)},
+		{ORB_ID(sensor_gnss_spectrum_block1)},
+		{ORB_ID(sensor_gnss_spectrum_block2)},
+	};
+#endif
+	uORB::PublicationMulti<satellite_info_s>	_report_sat_info_pub {ORB_ID(satellite_info)};		///< uORB pub for satellite info
 
 	failure_injection::Config _failure_config;
-	failure_injection::Stuck<sensor_gps_s> _stuck;
+	failure_injection::Stuck<sensor_gnss_s> _stuck;
 
 	float				_rate{0.0f};					///< position update rate
-	float				_rtcm_injection_rate{0.0f};			///< corrections injection rate (Hz, RTCM3 and SPARTN)
-	uint64_t			_last_rtcm_corrections_injection_count{0};	///< corrections-injection perf snapshot for rate calc
-	unsigned			_rtcm_frames_in_rate_window{0};			///< corrections-stream RTCM3 frames in rate window
-	unsigned			_spartn_frames_in_rate_window {0};		///< corrections-stream SPARTN frames in rate window
-	bool				_injecting_rtcm {false};				///< latched: RTCM3 corrections injected in last rate window
-	bool				_injecting_spartn {false};			///< latched: SPARTN injected in last rate window
 	unsigned			_num_bytes_read{0}; 				///< counter for number of read bytes from the UART (within update interval)
 	unsigned			_rate_reading{0}; 				///< reading rate in B/s
-	hrt_abstime			_last_rtcm_injection_time{0};			///< time of last corrections injection
-	uint8_t				_selected_rtcm_instance{0};			///< uorb instance that is being used for corrections
 
 	const Instance 			_instance;
 
-	uORB::SubscriptionMultiArray<rtcm_data_s, rtcm_data_s::MAX_INSTANCES> _rtcm_corrections_sub{ORB_ID::rtcm_corrections};
-	uORB::Subscription _rtcm_moving_baseline_sub{ORB_ID(rtcm_moving_baseline)};
+	gnss::CorrectionInjector		_injector;
+	gnss::CorrectionInjector::Config	_injector_config{};
+	bool				_inject{true};					///< false for a rover whose reference station is on UART2
+	bool				_injecting{false};
+
 	uORB::PublicationMulti<rtcm_data_s> _rtcm_corrections_pub{ORB_ID(rtcm_corrections)};
 	uORB::Publication<rtcm_data_s> _rtcm_moving_baseline_pub{ORB_ID(rtcm_moving_baseline)};
 	uORB::Publication<gps_dump_s>	     _dump_communication_pub{ORB_ID(gps_dump)};
@@ -270,25 +281,17 @@ private:
 	gps_dump_s			     *_dump_from_device{nullptr};
 	gps_dump_comm_mode_t                 _dump_communication_mode{gps_dump_comm_mode_t::Disabled};
 
-	// Each stream reassembles in its own framer: a fragmented fixed-base frame must not be
-	// corrupted by moving-baseline bytes appended mid-frame (e.g. fixed-base + moving-base +
-	// rover setups, where the rover injects both streams). Within a framer, RTCM3 and SPARTN
-	// share one buffer so neither protocol can resync inside the other's payloads (see
-	// correction_framer.h); SPARTN only ever arrives on the corrections stream.
-	gnss::CorrectionFramer		     _rtcm_corrections_framer{};
-	gnss::CorrectionFramer		     _rtcm_moving_baseline_framer{};
-
-	perf_counter_t _uart_tx_buffer_full_perf{perf_alloc(PC_COUNT, MODULE_NAME": tx buf full")};
-	perf_counter_t _correction_buffer_full_perf{perf_alloc(PC_COUNT, MODULE_NAME": corrections buf full")};
-	perf_counter_t _rtcm_corrections_injection_perf{perf_alloc(PC_COUNT, MODULE_NAME": rtcm corrections injected")};
-	perf_counter_t _rtcm_moving_baseline_injection_perf{perf_alloc(PC_COUNT, MODULE_NAME": rtcm moving baseline injected")};
-
-	static px4::atomic_bool _is_gps_main_advertised; ///< for the second gps we want to make sure that it gets instance 1
-	/// and thus we wait until the first one publishes at least one message.
-
+	// For the second gps we want to make sure that it gets instance 1 and thus we wait until the first one publishes at least one message.
+	static px4::atomic_bool _is_gps_main_advertised;
+	static px4::atomic_bool _is_sat_info_main_advertised;
+	static px4::atomic_bool _is_rf_block_main_advertised[kMaxBlocks];
+#if defined(CONFIG_GPS_UBX_SPAN)
+	static px4::atomic_bool _is_spectrum_block_main_advertised[kMaxBlocks];
+#endif
 	static px4::atomic<GPS *> _secondary_instance;
 
 	px4::atomic<int> _scheduled_reset{(int)GPSRestartType::None};
+	bool _reset_performed{false};	///< a reset we issued dropped the receiver, so _mode is still known good
 
 	/**
 	 * Publish the gps struct
@@ -306,9 +309,21 @@ private:
 	void 				publishRTCMCorrections(uint8_t *data, size_t len);
 
 	/**
-	 * Publish RTCM corrections
+	 * Publish relative position
 	 */
 	void 				publishRelativePosition(sensor_gnss_relative_s &gnss_relative);
+
+	/**
+	 * Publish RF data
+	 */
+	void 				publishRF(sensor_gnss_rf_s &gnss_rf);
+
+#if defined(CONFIG_GPS_UBX_SPAN)
+	/**
+	 * Publish spectrum
+	 */
+	void 				publishSpectrum(sensor_gnss_spectrum_s &gnss_spectrum);
+#endif
 
 	/**
 	 * This is an abstraction for the poll on serial used.
@@ -322,36 +337,8 @@ private:
 	 */
 	int pollOrRead(uint8_t *buf, size_t buf_length, int timeout);
 
-	/**
-	 * check for new messages on the inject data topic & handle them
-	 */
-	void handleInjectDataTopic();
-
-	/**
-	 * Drain the multi-instance rtcm_corrections subscription into its RTCM parser, selecting an
-	 * active instance if the current one goes stale.
-	 */
-	void drainRtcmCorrections();
-
-	/**
-	 * Drain the single-publisher rtcm_moving_baseline subscription into its RTCM parser.
-	 */
-	void drainMovingBaseline();
-
-	/**
-	 * Inject all complete frames reassembled in a framer (RTCM3 and/or SPARTN) into the receiver,
-	 * counting each injected frame on the given perf counter and optional per-protocol rate-window
-	 * counters.
-	 */
-	void injectRtcmFrames(gnss::CorrectionFramer &framer, perf_counter_t injection_perf,
-			      unsigned *rtcm_frames_in_window = nullptr, unsigned *spartn_frames_in_window = nullptr);
-
-	/**
-	 * send data to the device, such as an RTCM stream
-	 * @param data
-	 * @param len
-	 */
-	inline bool injectData(const uint8_t *data, size_t len);
+	void updateInjection();
+	void stopInjection();
 
 	/**
 	 * set the Baudrate
@@ -380,7 +367,12 @@ private:
 };
 
 px4::atomic_bool GPS::_is_gps_main_advertised{false};
-px4::atomic<GPS *> GPS::_secondary_instance{nullptr};
+px4::atomic_bool GPS::_is_sat_info_main_advertised{false};
+px4::atomic_bool GPS::_is_rf_block_main_advertised[kMaxBlocks] {};
+#if defined(CONFIG_GPS_UBX_SPAN)
+px4::atomic_bool GPS::_is_spectrum_block_main_advertised[kMaxBlocks] {};
+#endif
+px4::atomic<GPS *> GPS::_secondary_instance {nullptr};
 ModuleBase::Descriptor GPS::desc{task_spawn, custom_command, print_usage};
 
 /*
@@ -395,7 +387,8 @@ GPS::GPS(const char *path, gps_driver_mode_t mode, GPSHelper::Interface interfac
 	_configured_baudrate(configured_baudrate),
 	_mode(mode),
 	_interface(interface),
-	_instance(instance)
+	_instance(instance),
+	_injector(MODULE_NAME, path)
 {
 	/* store port name */
 	if (path != nullptr) {
@@ -405,9 +398,6 @@ GPS::GPS(const char *path, gps_driver_mode_t mode, GPSHelper::Interface interfac
 	} else {
 		_port[0] = '\0';
 	}
-
-	_sensor_gps.heading = NAN;
-	_sensor_gps.heading_offset = NAN;
 
 	int32_t enable_sat_info = 0;
 	param_get(param_find("GPS_SAT_INFO"), &enable_sat_info);
@@ -491,11 +481,6 @@ GPS::~GPS()
 		} while (_secondary_instance.load() && i < 100);
 	}
 
-	perf_free(_uart_tx_buffer_full_perf);
-	perf_free(_correction_buffer_full_perf);
-	perf_free(_rtcm_corrections_injection_perf);
-	perf_free(_rtcm_moving_baseline_injection_perf);
-
 	delete _sat_info;
 	delete _dump_to_device;
 	delete _dump_from_device;
@@ -554,6 +539,23 @@ int GPS::callback(GPSCallbackType type, void *data1, int data2, void *user)
 
 		break;
 
+	case GPSCallbackType::gotRFMessage:
+		if (data1 && data2 == sizeof(sensor_gnss_rf_s)) {
+			gps->publishRF(*static_cast<sensor_gnss_rf_s *>(data1));
+		}
+
+		break;
+
+#if defined(CONFIG_GPS_UBX_SPAN)
+
+	case GPSCallbackType::gotSpectrumMessage:
+		if (data1 && data2 == sizeof(sensor_gnss_spectrum_s)) {
+			gps->publishSpectrum(*static_cast<sensor_gnss_spectrum_s *>(data1));
+		}
+
+		break;
+#endif
+
 	case GPSCallbackType::surveyInStatus:
 		/* not used */
 		break;
@@ -564,7 +566,10 @@ int GPS::callback(GPSCallbackType type, void *data1, int data2, void *user)
 		timespec rtc_gps_time = *(timespec *)data1;
 		int drift_time = abs(static_cast<long>(rtc_system_time.tv_sec - rtc_gps_time.tv_sec));
 
-		if (drift_time >= SET_CLOCK_DRIFT_TIME_S) {
+		int32_t sys_time_src = 0;
+		param_get(param_find("SYS_TIME_SRC"), &sys_time_src);
+
+		if (drift_time >= SET_CLOCK_DRIFT_TIME_S && (sys_time_src & SYS_TIME_SRC_GPS)) {
 			// as of 2021 setting the time on Nuttx temporarily pauses interrupts
 			// so only set the time if it is very wrong.
 			// TODO: clock slewing of the RTC for small time differences
@@ -585,7 +590,7 @@ int GPS::pollOrRead(uint8_t *buf, size_t buf_length, int timeout)
 	const int max_timeout = 50;
 	int timeout_adjusted = math::min(max_timeout, timeout);
 
-	handleInjectDataTopic();
+	updateInjection();
 
 	if (_interface == GPSHelper::Interface::UART) {
 		ret = _uart.readAtLeast(buf, buf_length, math::min(character_count, buf_length), timeout_adjusted);
@@ -644,172 +649,29 @@ int GPS::pollOrRead(uint8_t *buf, size_t buf_length, int timeout)
 	return ret;
 }
 
-void GPS::drainRtcmCorrections()
+void GPS::updateInjection()
 {
-	// rtcm_corrections may have several sources (MAVLink plus CAN nodes), one uORB instance each.
-	rtcm_data_s msg;
-	bool already_copied = false;
+	// receiverReady() is false mid-configuration, when nothing but configuration may be written to the receiver
+	const bool inject = _inject && _helper->receiverReady();
 
-	const hrt_abstime now = hrt_absolute_time();
+	if (inject && !_injecting) {
+		// The device type, part of the ID, is only final once the receiver is configured
+		_injector_config.own_device_id = get_device_id();
+		_injector_config.baudrate = _uart.getBaudrate();
+		_injector.start(_injector_config);
+		_injecting = true;
 
-	// If there has not been a valid RTCM message for a while, try to switch to a different RTCM link
-	if (now > _last_rtcm_injection_time + 5_s) {
-		for (int instance = 0; instance < _rtcm_corrections_sub.size(); instance++) {
-			if (_rtcm_corrections_sub[instance].advertised() && _rtcm_corrections_sub[instance].copy(&msg)) {
-				/* Don't select the own RTCM instance. In case it has a lower
-				 * instance number, it will be selected and will be rejected
-				 * later in the code, resulting in no RTCM injection at all.
-				 */
-				if (msg.device_id != get_device_id() && now < msg.timestamp + 5_s) {
-					already_copied = true;
-					_selected_rtcm_instance = instance;
-					break;
-				}
-			}
-		}
-	}
-
-	bool updated = already_copied;
-	size_t num_injections = 0;
-
-	// Limit maximum number of injections per call so a burst can't starve the driver loop.
-	do {
-		if (updated) {
-			num_injections++;
-
-			// Prevent injection of data from self
-			if (msg.device_id != get_device_id()) {
-				// Add data to the framer buffer for frame reassembly
-				if (_rtcm_corrections_framer.addData(msg.data, msg.len) < msg.len) {
-					perf_count(_correction_buffer_full_perf);
-				}
-
-				_last_rtcm_injection_time = hrt_absolute_time();
-			}
-		}
-
-		auto &sub = _rtcm_corrections_sub[_selected_rtcm_instance];
-		const unsigned last_generation = sub.get_last_generation();
-
-		updated = sub.update(&msg);
-
-		if (updated && sub.get_last_generation() != last_generation + 1) {
-			PX4_WARN("%s lost, generation %u -> %u", sub.get_topic()->o_name,
-				 last_generation, sub.get_last_generation());
-		}
-	} while (updated && num_injections < rtcm_data_s::ORB_QUEUE_LENGTH);
-}
-
-void GPS::drainMovingBaseline()
-{
-	// rtcm_moving_baseline has a single publisher (instance 0), so there is no stale-link instance
-	// selection - just drain the queue into the parser.
-	rtcm_data_s msg;
-	size_t num_injections = 0;
-
-	while (num_injections < rtcm_data_s::ORB_QUEUE_LENGTH) {
-		const unsigned last_generation = _rtcm_moving_baseline_sub.get_last_generation();
-
-		if (!_rtcm_moving_baseline_sub.update(&msg)) {
-			break;
-		}
-
-		num_injections++;
-
-		if (_rtcm_moving_baseline_sub.get_last_generation() != last_generation + 1) {
-			PX4_WARN("%s lost, generation %u -> %u", _rtcm_moving_baseline_sub.get_topic()->o_name,
-				 last_generation, _rtcm_moving_baseline_sub.get_last_generation());
-		}
-
-		// Prevent injection of data from self
-		if (msg.device_id != get_device_id()) {
-			if (_rtcm_moving_baseline_framer.addData(msg.data, msg.len) < msg.len) {
-				perf_count(_correction_buffer_full_perf);
-			}
-		}
+	} else if (!inject && _injecting) {
+		stopInjection();
 	}
 }
 
-void GPS::handleInjectDataTopic()
+void GPS::stopInjection()
 {
-	// receiverReady() is false until the receiver is configured, which keeps us from writing to the
-	// device mid-configuration.
-	if (!_helper->receiverReady()) {
-		return;
+	if (_injecting) {
+		_injector.stop();
+		_injecting = false;
 	}
-
-	// Fixed-base corrections (MAVLink GPS_RTCM_DATA, UAVCAN RTCMStream): RTCM3 and, when enabled,
-	// SPARTN framed from one buffer in arrival order. Every configured receiver can use these -
-	// including a UART2 moving-base rover, whose baseline arrives in hardware but which still wants
-	// fixed-base corrections over its main link.
-	drainRtcmCorrections();
-	injectRtcmFrames(_rtcm_corrections_framer, _rtcm_corrections_injection_perf,
-			 &_rtcm_frames_in_rate_window, &_spartn_frames_in_rate_window);
-
-	// Moving-baseline RTCM (RTCM 4072 etc.) from a peer moving-base GPS. Only a heading rover that
-	// receives the baseline through the flight controller (UART1 / CAN) injects it here; a UART2
-	// rover gets it in hardware and a moving base produces it. Single publisher, so no instance
-	// selection - and a separate framer keeps the two byte streams from interleaving into corrupt
-	// frames.
-	if (_helper->shouldInjectMovingBaseline()) {
-		drainMovingBaseline();
-		injectRtcmFrames(_rtcm_moving_baseline_framer, _rtcm_moving_baseline_injection_perf);
-	}
-}
-
-void GPS::injectRtcmFrames(gnss::CorrectionFramer &framer, perf_counter_t injection_perf,
-			   unsigned *rtcm_frames_in_window, unsigned *spartn_frames_in_window)
-{
-	// Inject all complete frames reassembled in this framer, in arrival order
-	size_t frame_len = {};
-	const uint8_t *frame_ptr = {};
-	gnss::CorrectionProtocol protocol = gnss::CorrectionProtocol::Rtcm3;
-
-	while ((frame_ptr = framer.getNextMessage(&frame_len, &protocol)) != nullptr) {
-		// Check TX buffer space before writing
-		if (_interface == GPSHelper::Interface::UART) {
-			const ssize_t tx_available = _uart.txSpaceAvailable();
-
-			if ((ssize_t)frame_len > tx_available) {
-				// TX buffer full, stop and let it drain - frames stay in the framer buffer
-				perf_count(_uart_tx_buffer_full_perf);
-				break;
-			}
-		}
-
-		injectData(frame_ptr, frame_len);
-		framer.consumeMessage(frame_len);
-		perf_count(injection_perf);
-
-		if (protocol == gnss::CorrectionProtocol::Rtcm3) {
-			if (rtcm_frames_in_window != nullptr) {
-				(*rtcm_frames_in_window)++;
-			}
-
-		} else if (spartn_frames_in_window != nullptr) {
-			(*spartn_frames_in_window)++;
-		}
-	}
-}
-
-bool GPS::injectData(const uint8_t *data, size_t len)
-{
-	dumpGpsData(data, len, gps_dump_comm_mode_t::Full, true);
-
-	size_t written = 0;
-
-	if (_interface == GPSHelper::Interface::UART) {
-		written = _uart.write((const void *) data, len);
-
-#ifdef __PX4_LINUX
-
-	} else if (_interface == GPSHelper::Interface::SPI) {
-		written = ::write(_spi_fd, data, len);
-		::fsync(_spi_fd);
-#endif
-	}
-
-	return written == len;
 }
 
 int GPS::setBaudrate(unsigned baud)
@@ -899,13 +761,7 @@ void GPS::dumpGpsData(const uint8_t *data, size_t len, gps_dump_comm_mode_t mode
 void
 GPS::run()
 {
-	param_t handle = param_find("GPS_YAW_OFFSET");
-	float heading_offset = 0.f;
-
-	if (handle != PARAM_INVALID) {
-		param_get(handle, &heading_offset);
-		heading_offset = matrix::wrap_pi(math::radians(heading_offset));
-	}
+	param_t handle = PARAM_INVALID;
 
 #if defined(CONFIG_GPS_UBX)
 
@@ -989,10 +845,25 @@ GPS::run()
 			ubx_mode = GPSDriverUBX::UBXMode::GroundControlStation;
 			break;
 
+		case 7:
+			ubx_mode = GPSDriverUBX::UBXMode::UCenterUART2;
+			break;
+
+		case 8:
+			ubx_mode = GPSDriverUBX::UBXMode::GalileoHAS;
+			break;
+
 		default:
 			break;
 
 		}
+	}
+
+	handle = param_find("GPS_UBX_BAUD1");
+	int32_t ubx_uart1_baudrate = 0;
+
+	if (handle != PARAM_INVALID) {
+		param_get(handle, &ubx_uart1_baudrate);
 	}
 
 	handle = param_find("GPS_UBX_BAUD2");
@@ -1015,6 +886,16 @@ GPS::run()
 	if (handle != PARAM_INVALID) {
 		param_get(handle, &jam_det_sensitivity_hi);
 	}
+
+#if defined(CONFIG_GPS_UBX_SPAN)
+	handle = param_find("GPS_UBX_SPECTRUM");
+	int32_t gps_ubx_spectrum = 0;
+
+	if (handle != PARAM_INVALID) {
+		param_get(handle, &gps_ubx_spectrum);
+	}
+
+#endif // CONFIG_GPS_UBX_SPAN
 
 #endif // CONFIG_GPS_UBX
 
@@ -1107,24 +988,44 @@ GPS::run()
 			_mode = kAutoDetectModes[0];
 		}
 
+		_inject = true;
+		_injector_config = {};
+
 		switch (_mode) {
 #if defined(CONFIG_GPS_UBX)
 
 		case gps_driver_mode_t::UBX: {
+				// A rover whose reference station is on UART2 takes nothing from the autopilot, and one relaying its
+				// moving base through the autopilot takes only that: see gnss::CorrectionInjector::Stream
+				_inject = ubx_mode != GPSDriverUBX::UBXMode::RoverWithMovingBaseUART2
+					  && ubx_mode != GPSDriverUBX::UBXMode::RoverWithStaticBaseUART2;
+
+				if (ubx_mode == GPSDriverUBX::UBXMode::RoverWithMovingBaseUART1) {
+					_injector_config.stream = gnss::CorrectionInjector::Stream::MovingBaseline;
+				}
+
+				// SPARTN and AssistNow (UBX-MGA) are u-blox formats: every other receiver takes RTCM3 only
+				_injector_config.protocols = gnss::protocol_bit(gnss::CorrectionProtocol::Rtcm3)
+							     | gnss::protocol_bit(gnss::CorrectionProtocol::Spartn)
+							     | gnss::protocol_bit(gnss::CorrectionProtocol::Ubx);
+
 				GPSDriverUBX::Settings settings = {
 					.dynamic_model = (uint8_t)gps_ubx_dynmodel,
 					.dgnss_timeout = (uint8_t)gps_ubx_dgnss_to,
 					.min_cno = (uint8_t)gps_ubx_min_cno,
 					.min_elev = (int8_t)gps_ubx_min_elev,
 					.output_rate = (uint8_t)gps_ubx_rate,
-					.heading_offset = heading_offset,
+					.uart1_baudrate = ubx_uart1_baudrate,
 					.uart2_baudrate = f9p_uart2_baudrate,
 					.ppk_output = ppk_output > 0,
+#if defined(CONFIG_GPS_UBX_SPAN)
+					.spectrum_analyzer = gps_ubx_spectrum > 0,
+#endif
 					.jam_det_sensitivity_hi = jam_det_sensitivity_hi > 0,
 					.mode = ubx_mode,
 				};
 
-				_helper = new GPSDriverUBX(_interface, &GPS::callback, this, &_sensor_gps, _p_report_sat_info, settings);
+				_helper = new GPSDriverUBX(_interface, &GPS::callback, this, &_sensor_gnss, _p_report_sat_info, settings);
 
 				set_device_type(DRV_GPS_DEVTYPE_UBX);
 				break;
@@ -1134,35 +1035,35 @@ GPS::run()
 #if defined(CONFIG_GPS_MTK)
 
 		case gps_driver_mode_t::MTK:
-			_helper = new GPSDriverMTK(&GPS::callback, this, &_sensor_gps);
+			_helper = new GPSDriverMTK(&GPS::callback, this, &_sensor_gnss);
 			set_device_type(DRV_GPS_DEVTYPE_MTK);
 			break;
 #endif // CONFIG_GPS_MTK
 #if defined(CONFIG_GPS_ASHTECH)
 
 		case gps_driver_mode_t::ASHTECH:
-			_helper = new GPSDriverAshtech(&GPS::callback, this, &_sensor_gps, _p_report_sat_info, heading_offset);
+			_helper = new GPSDriverAshtech(&GPS::callback, this, &_sensor_gnss, _p_report_sat_info);
 			set_device_type(DRV_GPS_DEVTYPE_ASHTECH);
 			break;
 #endif // CONFIG_GPS_ASHTECH
 #if defined(CONFIG_GPS_EMLIDREACH)
 
 		case gps_driver_mode_t::EMLIDREACH:
-			_helper = new GPSDriverEmlidReach(&GPS::callback, this, &_sensor_gps, _p_report_sat_info);
+			_helper = new GPSDriverEmlidReach(&GPS::callback, this, &_sensor_gnss, _p_report_sat_info);
 			set_device_type(DRV_GPS_DEVTYPE_EMLID_REACH);
 			break;
 #endif // CONFIG_GPS_EMLIDREACH
 #if defined(CONFIG_GPS_FEMTOMES)
 
 		case gps_driver_mode_t::FEMTOMES:
-			_helper = new GPSDriverFemto(&GPS::callback, this, &_sensor_gps, _p_report_sat_info, heading_offset);
+			_helper = new GPSDriverFemto(&GPS::callback, this, &_sensor_gnss, _p_report_sat_info);
 			set_device_type(DRV_GPS_DEVTYPE_FEMTOMES);
 			break;
 #endif // CONFIG_GPS_FEMTOMES
 #if defined(CONFIG_GPS_NMEA)
 
 		case gps_driver_mode_t::NMEA:
-			_helper = new GPSDriverNMEA(&GPS::callback, this, &_sensor_gps, _p_report_sat_info, heading_offset);
+			_helper = new GPSDriverNMEA(&GPS::callback, this, &_sensor_gnss, _p_report_sat_info);
 			set_device_type(DRV_GPS_DEVTYPE_NMEA);
 			break;
 #endif // CONFIG_GPS_NMEA
@@ -1207,9 +1108,7 @@ GPS::run()
 		if (_helper && _helper->configure(_baudrate, gpsConfig) == 0) {
 
 			/* reset report */
-			memset(&_sensor_gps, 0, sizeof(_sensor_gps));
-			_sensor_gps.heading = NAN;
-			_sensor_gps.heading_offset = heading_offset;
+			memset(&_sensor_gnss, 0, sizeof(_sensor_gnss));
 
 #if defined(CONFIG_GPS_UBX)
 
@@ -1288,7 +1187,21 @@ GPS::run()
 				healthy_timeout += TIMEOUT_DUMP_ADD;
 			}
 
-			PX4_INFO("GPS device configured @ %u baud", _baudrate);
+			const char *uart1_protocols = nullptr;
+#if defined(CONFIG_GPS_UBX)
+
+			if (_mode == gps_driver_mode_t::UBX) {
+				uart1_protocols = GPSDriverUBX::uart1Protocols(ubx_mode, ppk_output > 0);
+			}
+
+#endif // CONFIG_GPS_UBX
+
+			if (uart1_protocols) {
+				PX4_INFO("UART1: %s @ %u baud (autopilot)", uart1_protocols, _baudrate);
+
+			} else {
+				PX4_INFO("UART1: configured @ %u baud", _baudrate);
+			}
 
 			while ((helper_ret = _helper->receive(receive_timeout)) > 0 && !should_exit()) {
 
@@ -1310,18 +1223,9 @@ GPS::run()
 				if (now > last_rate_measurement + 5_s) {
 					float dt = (float)((now - last_rate_measurement)) / 1e6f;
 					_rate = last_rate_count / dt;
-					// Report the fixed-base corrections injection rate; moving-baseline injection is
-					// tracked separately on its own perf counter.
-					const uint64_t corrections_count = perf_event_count(_rtcm_corrections_injection_perf);
-					_rtcm_injection_rate = (corrections_count - _last_rtcm_corrections_injection_count) / dt;
-					_last_rtcm_corrections_injection_count = corrections_count;
-					_injecting_rtcm = _rtcm_frames_in_rate_window > 0;
-					_injecting_spartn = _spartn_frames_in_rate_window > 0;
 					_rate_reading = _num_bytes_read / dt;
 					last_rate_measurement = now;
 					last_rate_count = 0;
-					_rtcm_frames_in_rate_window = 0;
-					_spartn_frames_in_rate_window = 0;
 					_num_bytes_read = 0;
 					_helper->storeUpdateRates();
 					_helper->resetUpdateRates();
@@ -1370,11 +1274,10 @@ GPS::run()
 			if (_healthy) {
 				_healthy = false;
 				_rate = 0.0f;
-				_rtcm_injection_rate = 0.0f;
-				_injecting_rtcm = false;
-				_injecting_spartn = false;
 			}
 		}
+
+		stopInjection();
 
 		if (_interface == GPSHelper::Interface::UART) {
 			(void) _uart.close();
@@ -1387,7 +1290,12 @@ GPS::run()
 #endif
 		}
 
-		if (_mode_auto) {
+		// Dropping out of the receive loop normally means the protocol guess was
+		// wrong; after a reset we issued, keep the known-good mode.
+		const bool keep_mode = _reset_performed;
+		_reset_performed = false;
+
+		if (_mode_auto && !keep_mode) {
 			size_t i = 0;
 
 			while (kAutoDetectModes[i] != _mode && kAutoDetectModes[i] != gps_driver_mode_t::None) {
@@ -1472,40 +1380,23 @@ GPS::print_status()
 
 	PX4_INFO("status: %s, port: %s, baudrate: %d", _healthy ? "OK" : "NOT OK", _port, _baudrate);
 	PX4_INFO("sat info: %s", (_p_report_sat_info != nullptr) ? "enabled" : "disabled");
-	// Fixed-width labels so values stay aligned (longest: "rate RTCM injection")
+	// Fixed-width labels so values stay aligned
 	PX4_INFO("rate reading:        %6i B/s", _rate_reading);
 
-	if (_sensor_gps.timestamp != 0) {
+	if (_sensor_gnss.timestamp != 0) {
 		if (_helper) {
 			PX4_INFO("rate position:       %6.2f Hz", (double)_helper->getPositionUpdateRate());
 			PX4_INFO("rate velocity:       %6.2f Hz", (double)_helper->getVelocityUpdateRate());
 		}
 
 		PX4_INFO("rate publication:    %6.2f Hz", (double)_rate);
-		PX4_INFO("rate RTCM injection: %6.2f Hz", (double)_rtcm_injection_rate);
 
-		// _injecting_spartn stays false when CONFIG_GPS_SPARTN is disabled
-		const char *corrections = "none";
-
-		if (_injecting_rtcm && _injecting_spartn) {
-			corrections = "RTCM + SPARTN";
-
-		} else if (_injecting_rtcm) {
-			corrections = "RTCM";
-
-		} else if (_injecting_spartn) {
-			corrections = "SPARTN";
-		}
-
-		PX4_INFO("corrections:         %s", corrections);
-
-		print_message(ORB_ID(sensor_gps), _sensor_gps);
+		print_message(ORB_ID(sensor_gnss), _sensor_gnss);
 	}
 
-	perf_print_counter(_uart_tx_buffer_full_perf);
-	perf_print_counter(_correction_buffer_full_perf);
-	perf_print_counter(_rtcm_corrections_injection_perf);
-	perf_print_counter(_rtcm_moving_baseline_injection_perf);
+	if (_inject) {
+		_injector.print_status();
+	}
 
 	if (_instance == Instance::Main && _secondary_instance.load()) {
 		GPS *secondary_instance = _secondary_instance.load();
@@ -1542,6 +1433,7 @@ GPS::reset_if_scheduled()
 			PX4_INFO("Reset failed.");
 
 		} else {
+			_reset_performed = true;
 			PX4_INFO("Reset succeeded.");
 		}
 	}
@@ -1551,22 +1443,19 @@ void
 GPS::publish()
 {
 	if (_instance == Instance::Main || _is_gps_main_advertised.load()) {
-		_sensor_gps.device_id = get_device_id();
+		_sensor_gnss.device_id = get_device_id();
 
-		_sensor_gps.selected_rtcm_instance = _selected_rtcm_instance;
-		_sensor_gps.rtcm_injection_rate = _rtcm_injection_rate;
+		const int8_t rtcm_instance = _injector.selected_instance();
+		_sensor_gnss.selected_rtcm_instance = rtcm_instance > 0 ? rtcm_instance : 0;
+		_sensor_gnss.rtcm_injection_rate = _injector.injection_rate_hz();
 
 		_failure_config.update();
 
-		if (!failure_injection::process(_failure_config, failure_injection_s::FAILURE_UNIT_SENSOR_GPS,
-						_sensor_gps_pub.get_instance(), _sensor_gps, _stuck)) {
+		if (!failure_injection::process_gnss(_failure_config, _sensor_gnss_pub.get_instance(), _sensor_gnss, _stuck)) {
 			return;
 		}
 
-		_sensor_gps_pub.publish(_sensor_gps);
-		// Heading/yaw data can be updated at a lower rate than the other navigation data.
-		// The uORB message definition requires this data to be set to a NAN if no new valid data is available.
-		_sensor_gps.heading = NAN;
+		_sensor_gnss_pub.publish(_sensor_gnss);
 		_is_gps_main_advertised.store(true);
 	}
 }
@@ -1574,28 +1463,28 @@ GPS::publish()
 void
 GPS::publishSatelliteInfo()
 {
-	if (_instance == Instance::Main || _is_gps_main_advertised.load()) {
+	if (_instance == Instance::Main || _is_sat_info_main_advertised.load()) {
 		if (_p_report_sat_info != nullptr) {
 			_report_sat_info_pub.publish(*_p_report_sat_info);
 		}
 
-		_is_gps_main_advertised.store(true);
-
-	} else {
-		//we don't publish satellite info for the secondary gps
+		_is_sat_info_main_advertised.store(true);
 	}
 }
 
-// Chunk an RTCM byte stream into a uORB message and publish it. RTCM frames larger than the
-// message payload are split across consecutive publications (flags LSB = fragmented). Templated
-// on the publication so the same code serves both the corrections and moving-baseline topics.
-template <typename PubT>
-static void publish_rtcm_chunks(PubT &pub, const uint8_t *data, size_t len, hrt_abstime timestamp,
-				uint32_t device_id)
+// Chunk an RTCM byte stream into uORB messages. Frames larger than the message payload are split
+// across consecutive publications (flags LSB = fragmented).
+void
+GPS::publishRTCMCorrections(uint8_t *data, size_t len)
 {
+	// If this GPS is a moving base, its RTCM output is moving-baseline data for a rover (not
+	// external corrections). Route it to a dedicated topic so downstream consumers can tell it
+	// apart from fixed-base RTCM.
+	const bool moving_base = _helper && _helper->isMovingBase();
+
 	rtcm_data_s msg{};
-	msg.timestamp = timestamp;
-	msg.device_id = device_id;
+	msg.timestamp = hrt_absolute_time();
+	msg.device_id = get_device_id();
 
 	const size_t capacity = sizeof(msg.data);
 	msg.flags = (len > capacity) ? 1 : 0; // LSB: 1=fragmented
@@ -1606,25 +1495,15 @@ static void publish_rtcm_chunks(PubT &pub, const uint8_t *data, size_t len, hrt_
 		const size_t chunk = math::min(len - written, capacity);
 		msg.len = chunk;
 		memcpy(msg.data, &data[written], chunk);
-		pub.publish(msg);
+
+		if (moving_base) {
+			_rtcm_moving_baseline_pub.publish(msg);
+
+		} else {
+			_rtcm_corrections_pub.publish(msg);
+		}
+
 		written += chunk;
-	}
-}
-
-void
-GPS::publishRTCMCorrections(uint8_t *data, size_t len)
-{
-	const hrt_abstime timestamp = hrt_absolute_time();
-	const uint32_t device_id = get_device_id();
-
-	// If this GPS is a moving base, its RTCM output is moving-baseline data for a rover (not
-	// external corrections). Route it to a dedicated topic so downstream consumers can tell it
-	// apart from fixed-base RTCM.
-	if (_helper && _helper->isMovingBase()) {
-		publish_rtcm_chunks(_rtcm_moving_baseline_pub, data, len, timestamp, device_id);
-
-	} else {
-		publish_rtcm_chunks(_rtcm_corrections_pub, data, len, timestamp, device_id);
 	}
 }
 
@@ -1635,6 +1514,41 @@ GPS::publishRelativePosition(sensor_gnss_relative_s &gnss_relative)
 	gnss_relative.timestamp = hrt_absolute_time();
 	_sensor_gnss_relative_pub.publish(gnss_relative);
 }
+
+void
+GPS::publishRF(sensor_gnss_rf_s &gnss_rf)
+{
+	if (gnss_rf.block_id >= kMaxBlocks) {
+		return;
+	}
+
+	// impose Main instance to publish first to assign first index
+	if (_instance == Instance::Main || _is_rf_block_main_advertised[gnss_rf.block_id].load()) {
+		gnss_rf.device_id = get_device_id();
+		gnss_rf.timestamp = hrt_absolute_time();
+
+		_sensor_gnss_rf_block_pub[gnss_rf.block_id].publish(gnss_rf);
+		_is_rf_block_main_advertised[gnss_rf.block_id].store(true);
+	}
+}
+
+#if defined(CONFIG_GPS_UBX_SPAN)
+void
+GPS::publishSpectrum(sensor_gnss_spectrum_s &gnss_spectrum)
+{
+	if (gnss_spectrum.block_id >= kMaxBlocks) {
+		return;
+	}
+
+	// impose Main instance to publish first to assign first index
+	if (_instance == Instance::Main || _is_spectrum_block_main_advertised[gnss_spectrum.block_id].load()) {
+		gnss_spectrum.device_id = get_device_id();
+		gnss_spectrum.timestamp = hrt_absolute_time();
+		_sensor_gnss_spectrum_block_pub[gnss_spectrum.block_id].publish(gnss_spectrum);
+		_is_spectrum_block_main_advertised[gnss_spectrum.block_id].store(true);
+	}
+}
+#endif
 
 int
 GPS::custom_command(int argc, char *argv[])

@@ -43,16 +43,22 @@
 #include <gtest/gtest.h>
 
 #include "mission_base.h"
+#include "navigator.h"
+#include "support/mission_route_cache_test_peer.h"
 #include "support/navigator_dataman_test.h"
 #include "support/vector_mission_item_store.h"
 
 #include <initializer_list>
 #include <vector>
 
+#include <cstring>
+#include <uORB/Subscription.hpp>
+#include <uORB/topics/mavlink_log.h>
+
 class MissionBaseTestPeer : public MissionBase
 {
 public:
-	MissionBaseTestPeer() : MissionBase(nullptr, 8, 0) {}
+	explicit MissionBaseTestPeer(Navigator *navigator = nullptr) : MissionBase(navigator, 8, 0) {}
 
 	void setActiveMissionItems() override {}
 	bool setNextMissionItem() override { return false; }
@@ -62,9 +68,28 @@ public:
 		return _mission_store.loadItem(index, mission_item);
 	}
 
+	// Reject injected failures before writing dataman, then mirror only successful writes.
+	bool writeMissionItemToCache(int32_t index, mission_item_s &mission_item) override
+	{
+		if (!_mission_store.canWriteItem(index)
+		    || !MissionBase::writeMissionItemToCache(index, mission_item)) {
+			return false;
+		}
+
+		return _mission_store.writeItem(index, mission_item);
+	}
+
 	void loadTestMission(const std::vector<mission_item_s> &items)
 	{
 		_mission_store.setItems(items);
+		_mission.count = static_cast<int32_t>(_mission_store.itemCount());
+		_mission.current_seq = 0;
+	}
+
+	void loadTestMission(const std::vector<mission_item_s> &items, const mission_s &mission)
+	{
+		loadTestMission(items);
+		_mission = mission;
 		_mission.count = static_cast<int32_t>(_mission_store.itemCount());
 		_mission.current_seq = 0;
 	}
@@ -77,6 +102,11 @@ public:
 	void clearLoadFailures()
 	{
 		_mission_store.clearLoadFailures();
+	}
+
+	void setWriteFailureIndices(std::initializer_list<int32_t> indices)
+	{
+		_mission_store.setWriteFailureIndices(indices);
 	}
 
 	void setCurrentSequence(int32_t current_seq)
@@ -97,6 +127,7 @@ public:
 	using MissionBase::goToNextPositionItem;
 	using MissionBase::goToPreviousPositionItem;
 	using MissionBase::MissionTraversalType;
+	using MissionBase::resetMissionJumpCounter;
 
 private:
 	navigator_test::VectorMissionItemStore _mission_store{};
@@ -154,6 +185,77 @@ class IgnoreDoJumpMissionBaseTraversalTest : public NavigatorDatamanTestBase
 protected:
 	IgnoreDoJumpMissionBaseTestPeer mission_base{};
 };
+
+#if CONFIG_NAVIGATOR_FULL_MISSION_CACHE_SIZE > 0
+class MissionBaseRouteCacheSyncTest : public NavigatorDatamanTestBase
+{
+protected:
+	void SetUp() override
+	{
+		ASSERT_TRUE(_dataman_client.clearSync(DM_KEY_WAYPOINTS_OFFBOARD_0));
+		_navigator.get_mission_route_cache().invalidate();
+	}
+
+	void TearDown() override
+	{
+		_navigator.get_mission_route_cache().invalidate();
+	}
+
+	DatamanClient _dataman_client{};
+	Navigator _navigator{};
+	MissionBaseTestPeer _mission_base{&_navigator};
+};
+
+TEST_F(MissionBaseRouteCacheSyncTest, DoJumpWritesKeepRouteCacheCurrent)
+{
+	const std::vector<mission_item_s> items{
+		makeDoJump(1, 2),
+		makePositionItem(kBaseLat, kBaseLon, kAlt),
+	};
+
+	mission_s mission{};
+	mission.timestamp = hrt_absolute_time();
+	mission.mission_id = 1;
+	mission.count = static_cast<uint16_t>(items.size());
+	mission.current_seq = 0;
+	mission.land_start_index = -1;
+	mission.land_index = -1;
+	mission.mission_dataman_id = DM_KEY_WAYPOINTS_OFFBOARD_0;
+	_mission_base.loadTestMission(items, mission);
+
+	for (size_t i = 0; i < items.size(); ++i) {
+		mission_item_s item = items[i];
+		ASSERT_TRUE(_dataman_client.writeSync(DM_KEY_WAYPOINTS_OFFBOARD_0, static_cast<uint32_t>(i),
+						      reinterpret_cast<uint8_t *>(&item), sizeof(item)));
+	}
+
+	MissionRouteCache &route_cache = _navigator.get_mission_route_cache();
+	ASSERT_TRUE(MissionRouteCacheTestPeer::runCacheUntil(route_cache, mission,
+			[&] { return route_cache.missionItemsReady(mission); }));
+
+	int32_t mission_index = 0;
+	mission_item_s mission_item{};
+	ASSERT_EQ(_mission_base.getNonJumpItem(mission_index, mission_item,
+					       MissionBaseTestPeer::MissionTraversalType::FollowMissionControlFlow, true), PX4_OK);
+
+	mission_item_s cached_item{};
+	ASSERT_TRUE(route_cache.loadMissionItem(mission, 0, cached_item));
+	EXPECT_EQ(cached_item.do_jump_current_count, 1);
+
+	mission_item_s stored_item{};
+	ASSERT_TRUE(_dataman_client.readSync(DM_KEY_WAYPOINTS_OFFBOARD_0, 0,
+					     reinterpret_cast<uint8_t *>(&stored_item), sizeof(stored_item)));
+	EXPECT_EQ(stored_item.do_jump_current_count, 1);
+
+	_mission_base.resetMissionJumpCounter();
+
+	ASSERT_TRUE(route_cache.loadMissionItem(mission, 0, cached_item));
+	EXPECT_EQ(cached_item.do_jump_current_count, 0);
+	ASSERT_TRUE(_dataman_client.readSync(DM_KEY_WAYPOINTS_OFFBOARD_0, 0,
+					     reinterpret_cast<uint8_t *>(&stored_item), sizeof(stored_item)));
+	EXPECT_EQ(stored_item.do_jump_current_count, 0);
+}
+#endif // CONFIG_NAVIGATOR_FULL_MISSION_CACHE_SIZE
 
 // WHY: getNonJumpItem is used to find the next mission item.
 // WHAT: A non-DO_JUMP item is returned unchanged.
@@ -283,6 +385,229 @@ TEST_F(MissionBaseTraversalTest, GetNonJumpItemReturnsErrorForOutOfBoundsDoJumpT
 	// THEN: The helper returns an error.
 	EXPECT_EQ(ret, PX4_ERROR);
 	EXPECT_EQ(mission_index, 0);
+}
+
+// Fixture with a real Navigator so the storage failure path is observable, it
+// publishes to mavlink_log through the navigator instead of a null pointer.
+class MissionBasePastBoundsTraversalTest : public NavigatorDatamanTestBase
+{
+protected:
+	bool storageErrorPublished()
+	{
+		mavlink_log_s report;
+
+		while (_mavlink_log_sub.update(&report)) {
+			if (strstr(reinterpret_cast<const char *>(report.text), "could not be read") != nullptr) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	Navigator _navigator{};
+	MissionBaseTestPeer mission_base{&_navigator};
+	uORB::Subscription _mavlink_log_sub{ORB_ID(mavlink_log)};
+};
+
+// Fixture with a real Navigator and a mission bound to a dataman area, so DO_JUMP counters are
+// written for real and a failure injected in the store is the only thing that stops them.
+class MissionBaseJumpCounterWriteTest : public NavigatorDatamanTestBase
+{
+protected:
+	void SetUp() override
+	{
+		ASSERT_TRUE(_dataman_client.clearSync(DM_KEY_WAYPOINTS_OFFBOARD_0));
+		_navigator.get_mission_result()->item_do_jump_changed = false;
+
+		// only messages published by this test count
+		mavlink_log_s report;
+
+		while (_mavlink_log_sub.update(&report)) {}
+	}
+
+	// [WP0, WP1, DO_JUMP->0 with two repeats left, WP3]
+	void loadJumpMission()
+	{
+		mission_s mission{};
+		mission.timestamp = hrt_absolute_time();
+		mission.mission_id = 1;
+		mission.mission_dataman_id = DM_KEY_WAYPOINTS_OFFBOARD_0;
+		mission.land_start_index = -1;
+		mission.land_index = -1;
+		mission_base.loadTestMission({
+			makePositionItem(kBaseLat, kBaseLon, kAlt), // idx 0
+			makePositionItem(kBaseLat + 0.001, kBaseLon, kAlt), // idx 1
+			makeDoJump(0, 2, 0), // idx 2
+			makePositionItem(kBaseLat + 0.002, kBaseLon, kAlt), // idx 3
+		}, mission);
+	}
+
+	uint16_t storedJumpCount()
+	{
+		mission_item_s item{};
+		EXPECT_TRUE(mission_base.loadMissionItemFromCache(2, item));
+		return item.do_jump_current_count;
+	}
+
+	bool jumpMessagePublished()
+	{
+		mavlink_log_s report;
+
+		while (_mavlink_log_sub.update(&report)) {
+			if (strstr(reinterpret_cast<const char *>(report.text), "DO JUMP could not be saved") != nullptr) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	DatamanClient _dataman_client{};
+	Navigator _navigator{};
+	MissionBaseTestPeer mission_base{&_navigator};
+	uORB::Subscription _mavlink_log_sub{ORB_ID(mavlink_log)};
+};
+
+// WHY: A jump that is counted is the normal case and must keep working as before.
+// WHAT: [WP0, WP1, DO_JUMP->0 (2 left), WP3] entered at the DO_JUMP returns idx 0 and stores count 1.
+TEST_F(MissionBaseJumpCounterWriteTest, GetNonJumpItemFollowsDoJumpWhenCounterIsStored)
+{
+	loadJumpMission();
+
+	int32_t mission_index = 2;
+	mission_item_s mission_item{};
+
+	const int ret = mission_base.getNonJumpItem(mission_index, mission_item,
+			MissionBaseTestPeer::MissionTraversalType::FollowMissionControlFlow,
+			true, false);
+
+	ASSERT_EQ(ret, PX4_OK);
+	EXPECT_EQ(mission_index, 0);
+	EXPECT_EQ(storedJumpCount(), 1);
+	EXPECT_TRUE(_navigator.get_mission_result()->item_do_jump_changed);
+	EXPECT_EQ(_navigator.get_mission_result()->item_do_jump_remaining, 1);
+	EXPECT_FALSE(jumpMessagePublished());
+}
+
+// WHY: If the counter cannot be stored, following the jump would repeat it on every pass,
+// since the stored count never advances. The mission has to continue past the jump.
+// WHAT: With the write of idx 2 failing, entering at the DO_JUMP returns idx 3, the stored
+// count stays 0, nothing is reported as a jump, and the operator gets the message.
+TEST_F(MissionBaseJumpCounterWriteTest, GetNonJumpItemSkipsDoJumpWhenCounterCannotBeStored)
+{
+	loadJumpMission();
+	mission_base.setWriteFailureIndices({2});
+
+	int32_t mission_index = 2;
+	mission_item_s mission_item{};
+
+	const int ret = mission_base.getNonJumpItem(mission_index, mission_item,
+			MissionBaseTestPeer::MissionTraversalType::FollowMissionControlFlow,
+			true, false);
+
+	ASSERT_EQ(ret, PX4_OK);
+	EXPECT_EQ(mission_index, 3);
+	EXPECT_EQ(mission_item.nav_cmd, NAV_CMD_WAYPOINT);
+	EXPECT_DOUBLE_EQ(mission_item.lat, kBaseLat + 0.002);
+	EXPECT_EQ(storedJumpCount(), 0);
+	EXPECT_FALSE(_navigator.get_mission_result()->item_do_jump_changed);
+	EXPECT_TRUE(jumpMessagePublished());
+}
+
+// WHY: Backward traversal has to step the same way past a jump it cannot count.
+// WHAT: With the write of idx 2 failing, entering at the DO_JUMP backward returns idx 1.
+TEST_F(MissionBaseJumpCounterWriteTest, GetNonJumpItemStepsBackPastDoJumpWhenCounterCannotBeStored)
+{
+	loadJumpMission();
+	mission_base.setWriteFailureIndices({2});
+
+	int32_t mission_index = 2;
+	mission_item_s mission_item{};
+
+	const int ret = mission_base.getNonJumpItem(mission_index, mission_item,
+			MissionBaseTestPeer::MissionTraversalType::FollowMissionControlFlow,
+			true, true);
+
+	ASSERT_EQ(ret, PX4_OK);
+	EXPECT_EQ(mission_index, 1);
+	EXPECT_EQ(storedJumpCount(), 0);
+}
+
+// WHY: Resolving a set-current index follows a jump without consuming a repetition, so a
+// storage failure does not apply to it and it keeps following the jump.
+// WHAT: With the write of idx 2 failing and write_jumps false, entering at the DO_JUMP returns idx 0.
+TEST_F(MissionBaseJumpCounterWriteTest, GetNonJumpItemStillFollowsDoJumpWithoutWritingCounters)
+{
+	loadJumpMission();
+	mission_base.setWriteFailureIndices({2});
+
+	int32_t mission_index = 2;
+	mission_item_s mission_item{};
+
+	const int ret = mission_base.getNonJumpItem(mission_index, mission_item,
+			MissionBaseTestPeer::MissionTraversalType::FollowMissionControlFlow,
+			false, false);
+
+	ASSERT_EQ(ret, PX4_OK);
+	EXPECT_EQ(mission_index, 0);
+	EXPECT_EQ(storedJumpCount(), 0);
+	EXPECT_FALSE(jumpMessagePublished());
+}
+
+// WHY: Walking off the end of the mission while skipping an exhausted DO_JUMP is the
+// normal end of a mission, not a storage failure.
+// WHAT: [WP0, DO_JUMP->0 done] entered at the DO_JUMP returns PX4_ERROR without
+// publishing a storage error.
+TEST_F(MissionBasePastBoundsTraversalTest, GetNonJumpItemReturnsErrorPastMissionEnd)
+{
+	// GIVEN: A mission whose last item is a DO_JUMP with no repeats left.
+	mission_base.loadTestMission({
+		makePositionItem(kBaseLat, kBaseLon, kAlt), // idx 0
+		makeDoJump(0, 1, 1), // idx 1
+	});
+
+	int32_t mission_index = 1;
+	mission_item_s mission_item{};
+	(void)storageErrorPublished(); // drain anything already queued
+
+	// WHEN: The helper skips the exhausted jump while traversing forward.
+	const int ret = mission_base.getNonJumpItem(mission_index, mission_item,
+			MissionBaseTestPeer::MissionTraversalType::FollowMissionControlFlow,
+			false, false);
+
+	// THEN: It reports no further item, exactly like an out of range entry index,
+	// and no "could not be read" error is published.
+	EXPECT_EQ(ret, PX4_ERROR);
+	EXPECT_EQ(mission_index, 1);
+	EXPECT_FALSE(storageErrorPublished());
+}
+
+// WHY: The same walk moving backward can step in front of the first item.
+// WHAT: [DO_JUMP->1 done, WP1] entered at the DO_JUMP backward returns PX4_ERROR
+// without publishing a storage error.
+TEST_F(MissionBasePastBoundsTraversalTest, GetNonJumpItemReturnsErrorPastMissionStart)
+{
+	// GIVEN: A mission that starts with a DO_JUMP with no repeats left.
+	mission_base.loadTestMission({
+		makeDoJump(1, 1, 1), // idx 0
+		makePositionItem(kBaseLat, kBaseLon, kAlt), // idx 1
+	});
+
+	int32_t mission_index = 0;
+	mission_item_s mission_item{};
+	(void)storageErrorPublished(); // drain anything already queued
+
+	// WHEN: The helper skips the exhausted jump while traversing backward.
+	const int ret = mission_base.getNonJumpItem(mission_index, mission_item,
+			MissionBaseTestPeer::MissionTraversalType::FollowMissionControlFlow,
+			false, true);
+
+	// THEN: It reports no further item, exactly like an out of range entry index,
+	// and no "could not be read" error is published.
+	EXPECT_EQ(ret, PX4_ERROR);
+	EXPECT_EQ(mission_index, 0);
+	EXPECT_FALSE(storageErrorPublished());
 }
 
 // WHY: Geometry-only position traversal must skip non-position mission items.
@@ -655,7 +980,7 @@ TEST_F(MissionBaseTraversalTest, GetPreviousPositionItemsFollowsActiveDoJump)
 	EXPECT_EQ(previous_items[0], 0);
 }
 
-// WHY: Mission-based RTL configures position traversal to skip DO_JUMP loops consistently.
+// WHY: Mission-based Return configures position traversal to skip DO_JUMP loops consistently.
 // WHAT: [DO_JUMP->2, WP1, WP2] from current_seq=-1 lands on idx 1 with the configured traversal.
 TEST_F(IgnoreDoJumpMissionBaseTraversalTest, ConfiguredTraversalSkipsDoJumpForGoToNextPositionItem)
 {
@@ -675,7 +1000,7 @@ TEST_F(IgnoreDoJumpMissionBaseTraversalTest, ConfiguredTraversalSkipsDoJumpForGo
 	EXPECT_EQ(mission_base.currentSequence(), 1);
 }
 
-// WHY: Reverse mission-path RTL must skip DO_JUMP loops for backward progression too.
+// WHY: Reverse mission-path Return must skip DO_JUMP loops for backward progression too.
 // WHAT: [WP0, WP1, DO_JUMP->0, WP3] from current_seq=3 lands on idx 1 with the configured traversal.
 TEST_F(IgnoreDoJumpMissionBaseTraversalTest, ConfiguredTraversalSkipsDoJumpForGoToPreviousPositionItem)
 {

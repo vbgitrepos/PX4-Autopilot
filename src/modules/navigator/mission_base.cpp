@@ -949,6 +949,7 @@ MissionBase::do_abort_landing()
 	vehicle_command.command = vehicle_command_s::VEHICLE_CMD_DO_REPOSITION;
 	vehicle_command.param1 = -1.f; // Default speed
 	vehicle_command.param2 = 1.f; // Modes should switch, not setting this is unsupported
+	vehicle_command.param4 = NAN;
 	vehicle_command.param5 = _mission_item.lat;
 	vehicle_command.param6 = _mission_item.lon;
 	vehicle_command.param7 = alt_sp;
@@ -1010,6 +1011,14 @@ int MissionBase::getNonJumpItem(int32_t &mission_index, mission_item_s &mission,
 	mission_item_s new_mission;
 
 	for (uint16_t jump_count = 0u; jump_count < MAX_JUMP_ITERATION; jump_count++) {
+		if (new_mission_index >= _mission.count || new_mission_index < 0) {
+			// Running off either end of the mission while skipping over jumps is a normal
+			// outcome, for example when the last item is a DO_JUMP that has used up its
+			// repeats. Report it the same way an out of range index is reported on entry
+			// rather than as a storage failure.
+			return PX4_ERROR;
+		}
+
 		/* read mission item from datamanager */
 		bool success = loadMissionItemFromCache(new_mission_index, new_mission);
 
@@ -1027,34 +1036,36 @@ int MissionBase::getNonJumpItem(int32_t &mission_index, mission_item_s &mission,
 				return PX4_ERROR;
 			}
 
-			if ((new_mission.do_jump_current_count < new_mission.do_jump_repeat_count)
-			    && traversal_type == MissionTraversalType::FollowMissionControlFlow) {
-				if (write_jumps) {
-					const dm_item_t mission_dataman_id = static_cast<dm_item_t>(_mission.mission_dataman_id);
-					new_mission.do_jump_current_count++;
-					success = _dataman_cache.writeWait(mission_dataman_id, new_mission_index, reinterpret_cast<uint8_t *>(&new_mission),
-									   sizeof(struct mission_item_s));
+			const bool jump_active = (new_mission.do_jump_current_count < new_mission.do_jump_repeat_count)
+						 && traversal_type == MissionTraversalType::FollowMissionControlFlow;
+			bool follow_jump = jump_active;
 
-					if (!success) {
-						/* not supposed to happen unless the datamanager can't access the dataman */
-						mavlink_log_critical(_navigator->get_mavlink_log_pub(), "DO JUMP waypoint could not be written.\t");
-						events::send(events::ID("mission_failed_to_write_do_jump"), events::Log::Error,
-							     "DO JUMP waypoint could not be written");
-						// Still continue searching for next non jump item.
-					}
+			if (jump_active && write_jumps) {
+				new_mission.do_jump_current_count++;
 
+				if (writeMissionItemToCache(new_mission_index, new_mission)) {
+					syncMissionRouteCacheItem(new_mission_index, new_mission);
 					report_do_jump_mission_changed(new_mission_index, new_mission.do_jump_repeat_count - new_mission.do_jump_current_count);
-				}
-
-				new_mission_index = new_mission.do_jump_mission_index;
-
-			} else {
-				if (mission_direction_backward) {
-					new_mission_index--;
 
 				} else {
-					new_mission_index++;
+					/* not supposed to happen unless the datamanager can't access the dataman */
+					mavlink_log_critical(_navigator->get_mavlink_log_pub(), "DO JUMP could not be saved, continuing without the jump.\t");
+					events::send(events::ID("mission_failed_to_write_do_jump"), events::Log::Error,
+						     "DO JUMP could not be saved, continuing without the jump");
+					// The repetition cannot be counted, so following the jump would repeat it on
+					// every pass over this item. Continue with the item after the jump instead.
+					follow_jump = false;
 				}
+			}
+
+			if (follow_jump) {
+				new_mission_index = new_mission.do_jump_mission_index;
+
+			} else if (mission_direction_backward) {
+				new_mission_index--;
+
+			} else {
+				new_mission_index++;
 			}
 
 		} else {
@@ -1105,6 +1116,21 @@ bool MissionBase::loadMissionItemFromCache(int32_t index, mission_item_s &missio
 	       && _dataman_cache.loadWait(static_cast<dm_item_t>(_mission.mission_dataman_id), index,
 					  reinterpret_cast<uint8_t *>(&mission_item), sizeof(mission_item),
 					  MAX_DATAMAN_LOAD_WAIT);
+}
+
+bool MissionBase::writeMissionItemToCache(int32_t index, mission_item_s &mission_item)
+{
+	const dm_item_t mission_dataman_id = static_cast<dm_item_t>(_mission.mission_dataman_id);
+
+	return _dataman_cache.writeWait(mission_dataman_id, static_cast<uint32_t>(index),
+					reinterpret_cast<uint8_t *>(&mission_item), sizeof(mission_item_s));
+}
+
+void MissionBase::syncMissionRouteCacheItem(int32_t index, const mission_item_s &mission_item)
+{
+	if (_navigator != nullptr) {
+		_navigator->get_mission_route_cache().syncMissionItem(_mission, index, mission_item);
+	}
 }
 
 bool MissionBase::findNextPositionIndex(int32_t start_index, int32_t &next_index,
@@ -1365,8 +1391,6 @@ void MissionBase::resetMission()
 
 void MissionBase::resetMissionJumpCounter()
 {
-	const dm_item_t mission_dataman_id = static_cast<dm_item_t>(_mission.mission_dataman_id);
-
 	for (size_t mission_index = 0u; mission_index < _mission.count; mission_index++) {
 		mission_item_s mission_item;
 
@@ -1383,14 +1407,12 @@ void MissionBase::resetMissionJumpCounter()
 		if (mission_item.nav_cmd == NAV_CMD_DO_JUMP) {
 			mission_item.do_jump_current_count = 0u;
 
-			bool write_success = _dataman_cache.writeWait(mission_dataman_id, mission_index,
-					     reinterpret_cast<uint8_t *>(&mission_item),
-					     sizeof(struct mission_item_s));
-
-			if (!write_success) {
+			if (!writeMissionItemToCache(static_cast<int32_t>(mission_index), mission_item)) {
 				PX4_ERR("Could not write mission item for jump count reset.");
 				break;
 			}
+
+			syncMissionRouteCacheItem(static_cast<int32_t>(mission_index), mission_item);
 		}
 	}
 }
