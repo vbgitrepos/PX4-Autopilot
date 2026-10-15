@@ -83,6 +83,9 @@ bmp581 -I -b 2 -a 0x46 start
 # Sensors barometer BMP581 on I2C4
 bmp581 -I -b 4 -a 0x47 start
 
+# Base board barometer MS5611 on I2C3 (external bus, default address 0x76)
+ms5611 -X -b 3 start
+
 # Sensors magnetometer BMM350 on I2C4
 bmm350 -I -b 4 -a 0x14 -R 6 start
 
