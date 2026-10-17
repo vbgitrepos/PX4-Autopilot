@@ -213,11 +213,11 @@
 #define GPIO_HW_VER_REV_DRIVE  /* PG0 */ (GPIO_OUTPUT|GPIO_PUSHPULL|GPIO_SPEED_2MHz|GPIO_OUTPUT_SET|GPIO_PORTG|GPIO_PIN0)
 #define GPIO_HW_REV_SENSE      /* PH4 */  GPIO_ADC3_INP15
 #define GPIO_HW_VER_SENSE      /* PH3 */  GPIO_ADC3_INP14
-#define HW_INFO_INIT_PREFIX    "V6X"
+#define HW_INFO_INIT_PREFIX    "SyroV6X"
 
 // #define BOARD_NUM_SPI_CFG_HW_VERSIONS 1
 //                 Base/FMUM
-// #define V6X_0     HW_FMUM_ID(0x0)   // SYRO Set Rev 0
+// #define SyroV6X_0     HW_FMUM_ID(0x0)   // SYRO Set Rev 0
 
 #define UAVCAN_NUM_IFACES_RUNTIME  1
 
