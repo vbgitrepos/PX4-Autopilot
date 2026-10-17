@@ -16,7 +16,7 @@ the first one that fails.
 | --- | --- |
 | U16 base EEPROM (24LC64, DFN-8) | 4 GND, 5 SDA, 6 SCL, 8 3V3 |
 | J4 GPS1 (Holybro M10) | 1 5V, 4 SCL, 5 SDA, 8 3V3, 9 buzzer, 10 GND |
-| J16 POWER1, J17 POWER2 | 3 SCL, 4 SDA |
+| J16 POWER1 | 3 SCL, 4 SDA |
 
 ## 1. Rails (multimeter)
 
