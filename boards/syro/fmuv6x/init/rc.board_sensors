@@ -89,9 +89,8 @@ ms5611 -X -b 3 start
 # Sensors magnetometer BMM350 on I2C4
 bmm350 -I -b 4 -a 0x14 -R 6 start
 
-# External compass on GPS modules
+# External compass on GPS modules (Holybro M10: IST8310)
 ist8310 -X start
-rm3100 -X start
 
 unset INA_CONFIGURED
 unset HAVE_PM2
