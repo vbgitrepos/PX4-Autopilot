@@ -55,6 +55,19 @@ menuconfig NAVIGATOR_GEOFENCE_PATH_CHECKS
 		mission with a waypoint outside it. Boards without the flash for it keep the
 		waypoint-only check.
 
+config NAVIGATOR_STACK_SIZE
+	int "Stack size of the navigator task"
+	default 3000 if NAVIGATOR_GEOFENCE_PATH_CHECKS
+	default 2230
+	depends on MODULES_NAVIGATOR
+	---help---
+		Stack size of the navigator task in bytes.
+
+		Checking an uploaded mission's flight path against the geofence is the deepest
+		call chain in navigator: it tests every leg against the fence polygons and reads
+		fence points from dataman synchronously, about 900 bytes deeper than any other
+		path. Boards with NAVIGATOR_GEOFENCE_PATH_CHECKS therefore get a larger default.
+
 menuconfig NAVIGATOR_ADSB_FAKE_TRAFFIC
 	bool "Include fake-traffic injection for DAA testing"
 	default n
