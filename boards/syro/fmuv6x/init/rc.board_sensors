@@ -87,8 +87,5 @@ bmp581 -I -b 2 -a 0x46 start
 # Internal baro BMP581 on I2C4
 bmp581 -I -b 4 -a 0x47 start
 
-# Base board baro MS5611 on I2C3 (external bus, the driver probes 0x76, then 0x77)
-ms5611 -X -b 3 start
-
 unset INA_CONFIGURED
 unset HAVE_PM2
