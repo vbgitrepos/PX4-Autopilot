@@ -34,7 +34,7 @@
 /**
  * @file board_config.h
  *
- * PX4FMU-v6x internal definitions
+ * Syro FMUv6X internal definitions
  */
 
 #pragma once

@@ -32,8 +32,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  *
  ************************************************************************************/
-#ifndef __NUTTX_CONFIG_PX4_FMU_V6X_INCLUDE_BOARD_H
-#define __NUTTX_CONFIG_PX4_FMU_V6X_INCLUDE_BOARD_H
+#ifndef __NUTTX_CONFIG_SYRO_FMUV6X_INCLUDE_BOARD_H
+#define __NUTTX_CONFIG_SYRO_FMUV6X_INCLUDE_BOARD_H
 
 /************************************************************************************
  * Included Files
@@ -55,7 +55,7 @@
  ************************************************************************************/
 
 /* Clocking *************************************************************************/
-/* The SYRO ROBOTICS _fmu-v6X  board provides the following clock sources:
+/* The Syro FMUv6X board provides the following clock sources:
  *
  *   X1: 16 MHz crystal for HSE
  *
@@ -318,7 +318,7 @@
 /* LED index values for use with board_userled() */
 
 /* LED definitions ******************************************************************/
-/* The px4_fmu-v6x board has three, LED_GREEN a Green LED, LED_BLUE a Blue LED and
+/* The Syro FMUv6X board has three, LED_GREEN a Green LED, LED_BLUE a Blue LED and
  * LED_RED a Red LED, that can be controlled by software.
  *
  * If CONFIG_ARCH_LEDS is not defined, then the user can control the LEDs in any way.
@@ -562,4 +562,4 @@
 # define PROBE_MARK(n)
 #endif
 
-#endif  /*__NUTTX_CONFIG_PX4_FMU_V6X_INCLUDE_BOARD_H  */
+#endif  /*__NUTTX_CONFIG_SYRO_FMUV6X_INCLUDE_BOARD_H  */

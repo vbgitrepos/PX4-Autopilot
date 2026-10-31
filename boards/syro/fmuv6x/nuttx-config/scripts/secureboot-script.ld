@@ -1,7 +1,7 @@
 /****************************************************************************
  * scripts/secureboot-script.ld
  *
- * Linker script for the px4_fmu-v6x_secureboot variant.
+ * Linker script for the syro_fmuv6x_secureboot variant.
  *
  * Same layout as script.ld, except:
  *   - The image table-of-contents (.main_toc, defined by src/toc.c)

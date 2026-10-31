@@ -61,12 +61,6 @@ else()
 		usb.c
 	)
 
-	# Secure-boot variant: populate the image TOC slot the linker
-	# script (selected via CONFIG_BOARD_LINKER_PREFIX) reserves.
-	if("${PX4_BOARD_LABEL}" STREQUAL "secureboot")
-		list(APPEND _drivers_board_sources toc.c)
-	endif()
-
 	add_library(drivers_board ${_drivers_board_sources})
 	add_dependencies(drivers_board arch_board_hw_info)
 
