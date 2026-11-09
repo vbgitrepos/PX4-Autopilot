@@ -294,7 +294,8 @@ int LogWriterFile::thread_start()
 #ifdef CONFIG_FS_LITTLEFS
 	pthread_attr_setstacksize(&thr_attr, PX4_STACK_ADJUSTED(1800));  /* littlefs needs more stack */
 #else
-	pthread_attr_setstacksize(&thr_attr, PX4_STACK_ADJUSTED(1170));
+	/* 1170 left only ~290 bytes free in flight on STM32H7 with FAT (load_mon warned below 300) */
+	pthread_attr_setstacksize(&thr_attr, PX4_STACK_ADJUSTED(1400));
 #endif
 
 	int ret = pthread_create(&_thread, &thr_attr, &LogWriterFile::run_helper, this);
