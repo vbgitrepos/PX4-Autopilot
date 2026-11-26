@@ -21,7 +21,8 @@ fi
 if param compare SENS_EN_INA226 1
 then
 	# Start Digital power monitors
-	ina226 -X -b 1 -t 1 -k start
+	# PM02D INA226 answers at 0x45, not the driver default 0x41
+	ina226 -X -b 1 -a 0x45 -t 1 -k start
 
 	if [ $HAVE_PM2 = yes ]
 	then
